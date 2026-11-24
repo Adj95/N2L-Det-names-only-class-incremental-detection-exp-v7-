@@ -1,0 +1,588 @@
+# N2L-Det on Kaggle (committed run)
+
+Free Colab GPU quota runs out and interactive sessions are lost when you leave. A *committed* Kaggle run executes the whole chain in the
+background without your tab open and keeps `/kaggle/working` as the version's output.
+
+## One-time setup
+1. Verify your phone number on kaggle.com (GPU and Internet stay locked until you do).
+2. Create a Dataset containing `n2l_det.zip` (Create -> New Dataset). Attach it to the notebook (Input -> Add Input).
+3. For VOC, attach existing Pascal VOC datasets as Input too (search "pascal voc 2007" and "pascal voc 2012"; any folder layout works, the loader
+   searches for `Annotations/`, `JPEGImages/`, `ImageSets/Main/`). Without them the chain downloads ~2.9 GB from the official host (Internet On
+   needed; the host is sometimes slow or down).
+   Look at the line the fetch step prints: `VOC protocol 07+12` is the standard benchmark. `12` or `07` means one year was not found.
+4. Notebook settings: Accelerator **GPU T4 x2** (the chain uses one), Internet **On**.
+5. Delete old cells so only the cells below remain. Cell 2 is the first committed run; Cell 3 works either right after Cell 2 in the same committed version, or on its own as a second version (then attach the first version's Notebook Output as Input, see 'Using a finished version later').
+
+## The cells
+
+### Cell 1 - one GPU, and see what is attached
+
+```
+%env CUDA_VISIBLE_DEVICES=0
+!nvidia-smi -L
+!ls /kaggle/input
+```
+
+**Expect:** Two `Tesla T4` lines (only one is used) and the attached datasets listed.
+
+### Cell 2 - the whole Pascal VOC 15+5 chain in one cell (run it with Save & Run All (Commit))
+
+```
+%%bash
+set -e
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if [ -f "$(dirname $f)/tune.py" ]; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with tune.py found: you attached an OLD n2l_det dataset; attach n2l_det_v2 only"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== FETCH ==="
+python run_pipeline.py fetch --dataset voc --tasks 15+5 --workdir /kaggle/working/work_voc --voc_root /kaggle/input --n_train_per_task 2000 --n_eval 2000 --n_yolo_train 12000 --n_yolo_val 500
+echo "=== GATE-CLIP ==="
+python run_pipeline.py gate-clip --workdir /kaggle/working/work_voc
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_after_fetch.tar -C /kaggle/working work_voc
+
+echo "=== YOLO ==="
+python run_pipeline.py make-yolo-data --workdir /kaggle/working/work_voc
+python run_pipeline.py train-yolo --workdir /kaggle/working/work_voc --yolo_init scratch --yolo_size s --yolo_epochs 40
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_after_yolo.tar -C /kaggle/working work_voc
+
+echo "=== EXTRACT + GATE-RECALL ==="
+python run_pipeline.py extract --workdir /kaggle/working/work_voc --conf 0.001 --max_det 300 --max_boxes 60
+python run_pipeline.py gate-recall --workdir /kaggle/working/work_voc
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_after_extract.tar -C /kaggle/working work_voc
+
+echo "=== RUN ==="
+python run_pipeline.py run --workdir /kaggle/working/work_voc --only E0_zeroshot E0_zeroshot_g0 E5_ours E5_no_refine E5_yolo_gamma0 E6_gt_ceiling E6_gt_ceiling_g0
+cat /kaggle/working/work_voc/results/ablation.md
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_after_run.tar -C /kaggle/working work_voc
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** Section banners `=== SETUP ===` ... `=== ALL DONE ===` in the log, four tars listed at the end.
+
+### Cell 3 - the improvement chain on the finished VOC run (runs after Cell 2 in the same version, or alone as a second version with the first version's Notebook Output attached as Input)
+
+```
+%%bash
+set -e
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if [ -f "$(dirname $f)/tune.py" ]; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with tune.py found: you attached an OLD n2l_det dataset; attach n2l_det_v2 only"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== RESTORE ==="
+if [ -d /kaggle/working/work_voc/cache ]; then echo "work_voc is already here (same session as Cell 2)"; else
+  T=$(find /kaggle/input -name work_voc_after_extract.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_after_extract.tar found: attach the first version's Notebook Output as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+echo "=== TUNE SPLIT ==="
+python run_pipeline.py fetch --dataset voc --tasks 15+5 --workdir /kaggle/working/work_voc --voc_root /kaggle/input --n_train_per_task 2000 --n_eval 2000 --n_yolo_train 12000 --n_yolo_val 500 --n_tune 500
+python run_pipeline.py extract --workdir /kaggle/working/work_voc --splits tune --conf 0.001 --max_det 300 --max_boxes 60
+
+echo "=== DIAGNOSE ==="
+python run_pipeline.py diagnose --workdir /kaggle/working/work_voc --eval_on tune
+cat /kaggle/working/work_voc/results/diagnose.md
+echo "=== TUNE ==="
+python run_pipeline.py tune --workdir /kaggle/working/work_voc --n_trials 20
+cat /kaggle/working/work_voc/results/tune.md
+echo "=== FINAL TABLE ==="
+python run_pipeline.py run --workdir /kaggle/working/work_voc --tuned /kaggle/working/work_voc/results/tune.json --only E0_zeroshot E0_zeroshot_g0 E5_ours E5_no_refine E5_yolo_gamma0 E6_gt_ceiling E6_gt_ceiling_g0 E0_zeroshot_tuned E5_tuned B_plain_ridge
+cat /kaggle/working/work_voc/results/ablation.md
+python compare_runs.py /kaggle/working/work_voc --ref E0_zeroshot_tuned --metric AP50 --out /kaggle/working/work_voc/results/compare_AP50.md
+python compare_runs.py /kaggle/working/work_voc --ref E0_zeroshot_tuned --metric AP50_new --out /kaggle/working/work_voc/results/compare_AP50_new.md
+echo "=== BASELINE (YOLO-World, needs Internet) ==="
+python run_pipeline.py baseline --workdir /kaggle/working/work_voc || echo 'baseline skipped (no Internet or no weights)'
+python compare_runs.py /kaggle/working/work_voc --ref E0_zeroshot_tuned --metric AP50 --also baselines.json || true
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_after_improve.tar -C /kaggle/working work_voc
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** Banners `=== RESTORE ===`, `=== TUNE SPLIT ===`, `=== DIAGNOSE ===`, `=== TUNE ===`, `=== FINAL TABLE ===`, `=== BASELINE ... ===`, `=== ALL DONE ===`; `work_voc_after_improve.tar` at the end. About 30-45 minutes (feature extraction for 500 tune images, 20 tuning trials).
+
+### Cell 4 - which tuned setting carries the gain, and training-subset seeds (a THIRD notebook; attach the improvement run's Notebook Output as Input)
+
+```
+%%bash
+set -e
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if grep -q cmd_loo "$f"; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with the loo command found: attach the NEWEST n2l_det dataset version (and not an older one)"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== RESTORE ==="
+if [ -f /kaggle/working/work_voc/results/tune.json ]; then echo "work_voc is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_after_improve.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_after_improve.tar found: attach the Notebook Output of the improvement run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+ls /kaggle/working/work_voc/results/tune.json
+echo "=== LOO ==="
+python run_pipeline.py loo --workdir /kaggle/working/work_voc
+echo "=== SEEDS ==="
+python run_pipeline.py seeds --workdir /kaggle/working/work_voc --n_seeds 5 --train_frac 0.8
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_after_loo.tar -C /kaggle/working work_voc
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** Banners `=== RESTORE ===`, `=== LOO ===`, `=== SEEDS ===`, `=== ALL DONE ===`; `work_voc_after_loo.tar` at the end. No downloads and no feature extraction; about 15-25 minutes (about 10 runs for `loo`, 5 seeds x 4 trainings for `seeds`; my estimate from the 48 s per run measured earlier).
+
+### Cell 5 - round-3 checks (a FOURTH, separate notebook; new dataset version n2l_det_v4; attach the improvement run's Notebook Output as Input; old notebooks stay untouched)
+
+```
+%%bash
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if grep -q cmd_perclass "$f"; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with the perclass command found: attach the NEWEST n2l_det dataset version (and not an older one)"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== RESTORE ==="
+if [ -f /kaggle/working/work_voc/results/tune.json ]; then echo "work_voc is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_after_improve.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_after_improve.tar found: attach the Notebook Output of the improvement run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+ls /kaggle/working/work_voc/results/tune.json || exit 1
+echo "=== LOO 10 FOLDS + GROUPS ==="
+python run_pipeline.py loo --workdir /kaggle/working/work_voc --n_folds 10 --tag f10 || echo "stage LOO 10 FOLDS + GROUPS FAILED"
+echo "=== PER CLASS ==="
+python run_pipeline.py perclass --workdir /kaggle/working/work_voc || echo "stage PER CLASS FAILED"
+echo "=== SWEEP ==="
+python run_pipeline.py sweep --workdir /kaggle/working/work_voc || echo "stage SWEEP FAILED"
+echo "=== LOO ALL LABEL TEMPLATES ==="
+python run_pipeline.py loo --workdir /kaggle/working/work_voc --n_folds 10 --label_templates 0 --tag lt_all || echo "stage LOO ALL LABEL TEMPLATES FAILED"
+echo "=== TUNE SEED 1 ==="
+python run_pipeline.py tune --workdir /kaggle/working/work_voc --n_trials 20 --tune_seed 1 --tag s1 || echo "stage TUNE SEED 1 FAILED"
+echo "=== LOO WITH TUNE SEED 1 ==="
+python run_pipeline.py loo --workdir /kaggle/working/work_voc --tuned /kaggle/working/work_voc/results/tune_s1.json --n_folds 10 --tag s1 || echo "stage LOO WITH TUNE SEED 1 FAILED"
+echo "=== TUNE SEED 2 ==="
+python run_pipeline.py tune --workdir /kaggle/working/work_voc --n_trials 20 --tune_seed 2 --tag s2 || echo "stage TUNE SEED 2 FAILED"
+echo "=== LOO WITH TUNE SEED 2 ==="
+python run_pipeline.py loo --workdir /kaggle/working/work_voc --tuned /kaggle/working/work_voc/results/tune_s2.json --n_folds 10 --tag s2 || echo "stage LOO WITH TUNE SEED 2 FAILED"
+echo "=== RESULT FILES ==="
+ls -l /kaggle/working/work_voc/results
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_after_round3.tar -C /kaggle/working work_voc
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** Banners `=== LOO 10 FOLDS + GROUPS ===`, `=== PER CLASS ===`, `=== SWEEP ===`, `=== LOO ALL LABEL TEMPLATES ===`, `=== TUNE SEED 1 ===`, `=== LOO WITH TUNE SEED 1 ===`, the same for seed 2, `=== RESULT FILES ===`, `=== ALL DONE ===`; `work_voc_after_round3.tar` at the end. A stage that fails prints `stage ... FAILED` and the rest still run. My estimate: 90-130 minutes (4 `loo` runs of about 18 trainings each, 2 x 20 tuning trials, `perclass` and `sweep` are short); it needs no Internet beyond package installation and no downloads.
+
+### Cell 6 - variants on the tune images + the untouched final split cache (a SEPARATE notebook; attach the improvement run's Notebook Output AND the VOC dataset; Internet On)
+
+```
+%%bash
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if grep -q cmd_variants "$f"; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with the variants command found: attach the NEWEST n2l_det dataset version (and not an older one)"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== RESTORE ==="
+if [ -f /kaggle/working/work_voc/results/tune.json ]; then echo "work_voc is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_after_improve.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_after_improve.tar found: attach the Notebook Output of the improvement run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+ls /kaggle/working/work_voc/results/tune.json || exit 1
+echo "=== VARIANTS (tune images, cache only) ==="
+python run_pipeline.py variants --workdir /kaggle/working/work_voc --n_folds 10 --tag v1 || echo "stage VARIANTS FAILED"
+echo "=== FINAL SPLIT ==="
+cp /kaggle/working/work_voc/splits.json /kaggle/working/work_voc/splits_before_final.json
+python run_pipeline.py fetch --dataset voc --tasks 15+5 --workdir /kaggle/working/work_voc --voc_root /kaggle/input --n_train_per_task 2000 --n_eval 2000 --n_yolo_train 12000 --n_yolo_val 500 --n_tune 500 --n_final 2000 || echo "stage FINAL FETCH FAILED"
+if python -c "import json; a=json.load(open('/kaggle/working/work_voc/splits_before_final.json')); b=json.load(open('/kaggle/working/work_voc/splits.json')); assert a['eval_ids']==b['eval_ids'] and a['tune_ids']==b['tune_ids'] and b['final_ids'], 'ids changed'; print('eval and tune ids unchanged; final images:', len(b['final_ids']))"; then
+python run_pipeline.py extract --workdir /kaggle/working/work_voc --splits final --conf 0.001 --max_det 300 --max_boxes 60 || echo "stage FINAL EXTRACT FAILED"
+else echo "stage FINAL EXTRACT SKIPPED: the eval/tune ids changed, do not use this final split"; fi
+echo "=== RESULT FILES ==="
+ls -l /kaggle/working/work_voc/results
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_after_final_split.tar -C /kaggle/working work_voc
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** Banners `=== VARIANTS ... ===`, `=== FINAL SPLIT ===` with `eval and tune ids unchanged; final images: 2000`, `=== RESULT FILES ===` (`variants_v1.md`), `=== ALL DONE ===`; `work_voc_after_final_split.tar` at the end. The variants stage is cache-only (about 15-25 minutes, my estimate); the final extraction is about as long as the eval extraction in Cell 2.
+
+### Cell 6b - CONFIRM the chosen variants on the eval images (a SEPARATE small notebook; attach the improvement run's Notebook Output; NEWEST n2l_det dataset (v5.1); no VOC dataset, no Internet needed)
+
+```
+%%bash
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if grep -q variants_eval "$f"; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with the variants --on eval option found: attach the NEWEST n2l_det dataset version (v5.1 or later)"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== RESTORE ==="
+if [ -f /kaggle/working/work_voc/results/tune.json ]; then echo "work_voc is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_after_improve.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_after_improve.tar found: attach the Notebook Output of the improvement run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+ls /kaggle/working/work_voc/results/tune.json || exit 1
+echo "=== CONFIRM ON EVAL (cache only) ==="
+python run_pipeline.py variants --workdir /kaggle/working/work_voc --on eval --only soft_1 topfrac_0.5 --n_folds 10 --tag v1 || echo "stage CONFIRM FAILED"
+echo "=== RESULT FILES ==="
+ls -l /kaggle/working/work_voc/results
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_after_confirm.tar -C /kaggle/working work_voc
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** Banners `=== RESTORE ===`, `=== CONFIRM ON EVAL (cache only) ===`, `=== RESULT FILES ===` (`variants_eval_v1.md`), `=== ALL DONE ===`. About 5-10 minutes (my estimate: 2 variants + 3 references, cache only). Pre-registered rule: a variant counts as CONFIRMED only if its AP50 difference vs `E5_tuned` is positive with an interval that excludes 0 AND its AP50_new difference is not negative; otherwise it is dropped. Chosen beforehand on the tune images (Cell 6): `soft_1`, `topfrac_0.5`.
+
+### Cell 7a - extraction variant: crop padding 0.3 (its OWN notebook; same inputs as Cell 6; a clone, the original is untouched)
+
+```
+%%bash
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if grep -q cmd_variants "$f"; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with the variants command found: attach the NEWEST n2l_det dataset version (and not an older one)"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== RESTORE ==="
+if [ -f /kaggle/working/work_voc/results/tune.json ]; then echo "work_voc is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_after_improve.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_after_improve.tar found: attach the Notebook Output of the improvement run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+ls /kaggle/working/work_voc/results/tune.json || exit 1
+echo "=== IMAGES (a clone points at the original work dir's image folder) ==="
+python run_pipeline.py fetch --dataset voc --tasks 15+5 --workdir /kaggle/working/work_voc --voc_root /kaggle/input --n_train_per_task 2000 --n_eval 2000 --n_yolo_train 12000 --n_yolo_val 500 --n_tune 500 || echo "stage FETCH FAILED"
+echo "=== CLONE pad03 ==="
+python run_pipeline.py clone --workdir /kaggle/working/work_voc_pad03 --src /kaggle/working/work_voc || echo "stage CLONE FAILED"
+echo "=== EXTRACT pad03 ==="
+python run_pipeline.py extract --workdir /kaggle/working/work_voc_pad03 --conf 0.001 --max_det 300 --max_boxes 60 --pad 0.3 || echo "stage EXTRACT FAILED"
+echo "=== TUNE pad03 ==="
+python run_pipeline.py tune --workdir /kaggle/working/work_voc_pad03 --n_trials 20 || echo "stage TUNE FAILED"
+echo "=== RUN pad03 ==="
+python run_pipeline.py run --workdir /kaggle/working/work_voc_pad03 --tuned /kaggle/working/work_voc_pad03/results/tune.json --only E0_zeroshot_tuned E5_tuned E6_gt_ceiling_tuned || echo "stage RUN FAILED"
+python compare_runs.py /kaggle/working/work_voc_pad03 --ref E0_zeroshot_tuned --metric AP50 --out /kaggle/working/work_voc_pad03/results/compare_AP50.md || true
+python compare_runs.py /kaggle/working/work_voc_pad03 --ref E0_zeroshot_tuned --metric AP50_new --out /kaggle/working/work_voc_pad03/results/compare_AP50_new.md || true
+cat /kaggle/working/work_voc_pad03/results/tune.md /kaggle/working/work_voc_pad03/results/ablation.md /kaggle/working/work_voc_pad03/results/compare_AP50.md /kaggle/working/work_voc_pad03/results/compare_AP50_new.md || true
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_pad03_after_variant.tar -C /kaggle/working work_voc_pad03
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** `=== CLONE pad03 ===`, `=== EXTRACT ===`, `=== TUNE ===`, `=== RUN ===`, then tune.md / ablation.md / compare tables. Compare the E5_tuned - E0_zeroshot_tuned gap with the original run's.
+
+### Cell 7b - extraction variant: crop padding 0.0 (tight crops; its own notebook)
+
+```
+%%bash
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if grep -q cmd_variants "$f"; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with the variants command found: attach the NEWEST n2l_det dataset version (and not an older one)"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== RESTORE ==="
+if [ -f /kaggle/working/work_voc/results/tune.json ]; then echo "work_voc is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_after_improve.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_after_improve.tar found: attach the Notebook Output of the improvement run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+ls /kaggle/working/work_voc/results/tune.json || exit 1
+echo "=== IMAGES (a clone points at the original work dir's image folder) ==="
+python run_pipeline.py fetch --dataset voc --tasks 15+5 --workdir /kaggle/working/work_voc --voc_root /kaggle/input --n_train_per_task 2000 --n_eval 2000 --n_yolo_train 12000 --n_yolo_val 500 --n_tune 500 || echo "stage FETCH FAILED"
+echo "=== CLONE pad00 ==="
+python run_pipeline.py clone --workdir /kaggle/working/work_voc_pad00 --src /kaggle/working/work_voc || echo "stage CLONE FAILED"
+echo "=== EXTRACT pad00 ==="
+python run_pipeline.py extract --workdir /kaggle/working/work_voc_pad00 --conf 0.001 --max_det 300 --max_boxes 60 --pad 0.0 || echo "stage EXTRACT FAILED"
+echo "=== TUNE pad00 ==="
+python run_pipeline.py tune --workdir /kaggle/working/work_voc_pad00 --n_trials 20 || echo "stage TUNE FAILED"
+echo "=== RUN pad00 ==="
+python run_pipeline.py run --workdir /kaggle/working/work_voc_pad00 --tuned /kaggle/working/work_voc_pad00/results/tune.json --only E0_zeroshot_tuned E5_tuned E6_gt_ceiling_tuned || echo "stage RUN FAILED"
+python compare_runs.py /kaggle/working/work_voc_pad00 --ref E0_zeroshot_tuned --metric AP50 --out /kaggle/working/work_voc_pad00/results/compare_AP50.md || true
+python compare_runs.py /kaggle/working/work_voc_pad00 --ref E0_zeroshot_tuned --metric AP50_new --out /kaggle/working/work_voc_pad00/results/compare_AP50_new.md || true
+cat /kaggle/working/work_voc_pad00/results/tune.md /kaggle/working/work_voc_pad00/results/ablation.md /kaggle/working/work_voc_pad00/results/compare_AP50.md /kaggle/working/work_voc_pad00/results/compare_AP50_new.md || true
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_pad00_after_variant.tar -C /kaggle/working work_voc_pad00
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** As Cell 7a.
+
+### Cell 7c - extraction variant: 100 proposals per image instead of 60, at the NEW crop padding 0.0 (its own notebook; compare it with Cell 7b, not with the original run)
+
+```
+%%bash
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if grep -q cmd_variants "$f"; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with the variants command found: attach the NEWEST n2l_det dataset version (and not an older one)"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== RESTORE ==="
+if [ -f /kaggle/working/work_voc/results/tune.json ]; then echo "work_voc is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_after_improve.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_after_improve.tar found: attach the Notebook Output of the improvement run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+ls /kaggle/working/work_voc/results/tune.json || exit 1
+echo "=== IMAGES (a clone points at the original work dir's image folder) ==="
+python run_pipeline.py fetch --dataset voc --tasks 15+5 --workdir /kaggle/working/work_voc --voc_root /kaggle/input --n_train_per_task 2000 --n_eval 2000 --n_yolo_train 12000 --n_yolo_val 500 --n_tune 500 || echo "stage FETCH FAILED"
+echo "=== CLONE boxes100 ==="
+python run_pipeline.py clone --workdir /kaggle/working/work_voc_boxes100 --src /kaggle/working/work_voc || echo "stage CLONE FAILED"
+echo "=== EXTRACT boxes100 ==="
+python run_pipeline.py extract --workdir /kaggle/working/work_voc_boxes100 --conf 0.001 --max_det 300 --max_boxes 100 --pad 0.0 || echo "stage EXTRACT FAILED"
+echo "=== TUNE boxes100 ==="
+python run_pipeline.py tune --workdir /kaggle/working/work_voc_boxes100 --n_trials 20 || echo "stage TUNE FAILED"
+echo "=== RUN boxes100 ==="
+python run_pipeline.py run --workdir /kaggle/working/work_voc_boxes100 --tuned /kaggle/working/work_voc_boxes100/results/tune.json --only E0_zeroshot_tuned E5_tuned E6_gt_ceiling_tuned || echo "stage RUN FAILED"
+python compare_runs.py /kaggle/working/work_voc_boxes100 --ref E0_zeroshot_tuned --metric AP50 --out /kaggle/working/work_voc_boxes100/results/compare_AP50.md || true
+python compare_runs.py /kaggle/working/work_voc_boxes100 --ref E0_zeroshot_tuned --metric AP50_new --out /kaggle/working/work_voc_boxes100/results/compare_AP50_new.md || true
+cat /kaggle/working/work_voc_boxes100/results/tune.md /kaggle/working/work_voc_boxes100/results/ablation.md /kaggle/working/work_voc_boxes100/results/compare_AP50.md /kaggle/working/work_voc_boxes100/results/compare_AP50_new.md || true
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_boxes100_after_variant.tar -C /kaggle/working work_voc_boxes100
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** As Cell 7a, but the reference is Cell 7b (same pad 0.0, 60 boxes): more boxes per image means higher recall but more background boxes in the pseudo-labels.
+
+### Cell 7d - extraction variant: CLIP ViT-L/14 instead of ViT-B/16 (its own notebook; the slowest)
+
+```
+%%bash
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if grep -q cmd_variants "$f"; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with the variants command found: attach the NEWEST n2l_det dataset version (and not an older one)"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== RESTORE ==="
+if [ -f /kaggle/working/work_voc/results/tune.json ]; then echo "work_voc is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_after_improve.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_after_improve.tar found: attach the Notebook Output of the improvement run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+ls /kaggle/working/work_voc/results/tune.json || exit 1
+echo "=== IMAGES (a clone points at the original work dir's image folder) ==="
+python run_pipeline.py fetch --dataset voc --tasks 15+5 --workdir /kaggle/working/work_voc --voc_root /kaggle/input --n_train_per_task 2000 --n_eval 2000 --n_yolo_train 12000 --n_yolo_val 500 --n_tune 500 || echo "stage FETCH FAILED"
+echo "=== CLONE clipL14 ==="
+python run_pipeline.py clone --workdir /kaggle/working/work_voc_clipL14 --src /kaggle/working/work_voc || echo "stage CLONE FAILED"
+echo "=== EXTRACT clipL14 ==="
+python run_pipeline.py extract --workdir /kaggle/working/work_voc_clipL14 --conf 0.001 --max_det 300 --max_boxes 60 --clip_model ViT-L-14 || echo "stage EXTRACT FAILED"
+echo "=== TUNE clipL14 ==="
+python run_pipeline.py tune --workdir /kaggle/working/work_voc_clipL14 --n_trials 20 --clip_model ViT-L-14 || echo "stage TUNE FAILED"
+echo "=== RUN clipL14 ==="
+python run_pipeline.py run --workdir /kaggle/working/work_voc_clipL14 --tuned /kaggle/working/work_voc_clipL14/results/tune.json --clip_model ViT-L-14 --only E0_zeroshot_tuned E5_tuned E6_gt_ceiling_tuned || echo "stage RUN FAILED"
+python compare_runs.py /kaggle/working/work_voc_clipL14 --ref E0_zeroshot_tuned --metric AP50 --out /kaggle/working/work_voc_clipL14/results/compare_AP50.md || true
+python compare_runs.py /kaggle/working/work_voc_clipL14 --ref E0_zeroshot_tuned --metric AP50_new --out /kaggle/working/work_voc_clipL14/results/compare_AP50_new.md || true
+cat /kaggle/working/work_voc_clipL14/results/tune.md /kaggle/working/work_voc_clipL14/results/ablation.md /kaggle/working/work_voc_clipL14/results/compare_AP50.md /kaggle/working/work_voc_clipL14/results/compare_AP50_new.md || true
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_clipL14_after_variant.tar -C /kaggle/working work_voc_clipL14
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** As Cell 7a. A larger CLIP changes E0 too: read the gap E5_tuned - E0_zeroshot_tuned, not E5 alone. Needs more GPU memory and time than B/16 (my estimate: 2-3 times the extraction time).
+
+### Cell 8 - pad 0.0 stability checks, cache-only (a SEPARATE notebook; attach TWO Notebook Outputs: the improvement run's AND the Cell 7b run's; no VOC dataset, no Internet beyond packages)
+
+```
+%%bash
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if grep -q cmd_variants "$f"; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with the variants command found: attach the NEWEST n2l_det dataset version (and not an older one)"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== RESTORE ==="
+if [ -f /kaggle/working/work_voc/results/tune.json ]; then echo "work_voc is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_after_improve.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_after_improve.tar found: attach the Notebook Output of the improvement run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+if [ -f /kaggle/working/work_voc_pad00/results/tune.json ]; then echo "work_voc_pad00 is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_pad00_after_variant.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_pad00_after_variant.tar found: attach the Notebook Output of the Cell 7b run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+ls /kaggle/working/work_voc/results/tune.json /kaggle/working/work_voc_pad00/results/tune.json || exit 1
+echo "=== LOO 10 FOLDS + GROUPS ==="
+python run_pipeline.py loo --workdir /kaggle/working/work_voc_pad00 --n_folds 10 --tag f10 || echo "stage LOO 10 FOLDS + GROUPS FAILED"
+echo "=== PER CLASS ==="
+python run_pipeline.py perclass --workdir /kaggle/working/work_voc_pad00 || echo "stage PER CLASS FAILED"
+echo "=== TUNE SEED 1 ==="
+python run_pipeline.py tune --workdir /kaggle/working/work_voc_pad00 --n_trials 20 --tune_seed 1 --tag s1 || echo "stage TUNE SEED 1 FAILED"
+echo "=== LOO WITH TUNE SEED 1 ==="
+python run_pipeline.py loo --workdir /kaggle/working/work_voc_pad00 --tuned /kaggle/working/work_voc_pad00/results/tune_s1.json --n_folds 10 --tag s1 || echo "stage LOO WITH TUNE SEED 1 FAILED"
+echo "=== TUNE SEED 2 ==="
+python run_pipeline.py tune --workdir /kaggle/working/work_voc_pad00 --n_trials 20 --tune_seed 2 --tag s2 || echo "stage TUNE SEED 2 FAILED"
+echo "=== LOO WITH TUNE SEED 2 ==="
+python run_pipeline.py loo --workdir /kaggle/working/work_voc_pad00 --tuned /kaggle/working/work_voc_pad00/results/tune_s2.json --n_folds 10 --tag s2 || echo "stage LOO WITH TUNE SEED 2 FAILED"
+echo "=== RESULT FILES ==="
+ls -l /kaggle/working/work_voc_pad00/results
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_pad00_after_followup.tar -C /kaggle/working work_voc_pad00
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** Banners `=== RESTORE ===` (two tars), `=== LOO 10 FOLDS + GROUPS ===`, `=== PER CLASS ===`, `=== TUNE SEED 1 ===`, `=== LOO WITH TUNE SEED 1 ===`, the same for seed 2, `=== RESULT FILES ===`, `=== ALL DONE ===`; `work_voc_pad00_after_followup.tar`. A failed stage prints `stage ... FAILED` and the rest still run. My estimate: 60-90 minutes (3 `loo` runs of about 18 trainings each plus 2 x 20 tuning trials; Cell 5 did more than this in 8181 s). Read: does `group.n2l_machinery` still matter at pad 0.0, and is the E5 - E0 gain still there with a different tuned setting?
+
+### Cell 9 - the untouched FINAL split cache at pad 0.0 (a SEPARATE notebook; attach TWO Notebook Outputs: the improvement run's AND the Cell 7b run's; plus the VOC datasets; Internet On)
+
+```
+%%bash
+export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+
+echo "=== SETUP ==="
+echo "candidate packages:"; find /kaggle/input -name run_pipeline.py
+RP=""; for f in $(find /kaggle/input -name run_pipeline.py); do if grep -q cmd_variants "$f"; then RP=$f; break; fi; done
+if [ -z "$RP" ]; then echo "no package with the variants command found: attach the NEWEST n2l_det dataset version (and not an older one)"; exit 1; fi
+echo "using: $RP"
+rm -rf /kaggle/working/n2l_det; cp -r "$(dirname $RP)" /kaggle/working/n2l_det
+cd /kaggle/working/n2l_det
+pip -q install pycocotools open_clip_torch ultralytics
+python -c "import open_clip, ultralytics, pycocotools, torch; print('imports ok | cuda:', torch.cuda.is_available())"
+python run_pipeline.py selftest | tail -3
+
+echo "=== RESTORE ==="
+if [ -f /kaggle/working/work_voc/results/tune.json ]; then echo "work_voc is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_after_improve.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_after_improve.tar found: attach the Notebook Output of the improvement run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+if [ -f /kaggle/working/work_voc_pad00/results/tune.json ]; then echo "work_voc_pad00 is already here (same session)"; else
+  T=$(find /kaggle/input -name work_voc_pad00_after_variant.tar | head -1); echo "tar: $T"
+  [ -n "$T" ] || { echo "no work_voc_pad00_after_variant.tar found: attach the Notebook Output of the Cell 7b run as Input"; exit 1; }
+  tar -xf "$T" -C /kaggle/working
+fi
+ls /kaggle/working/work_voc/results/tune.json /kaggle/working/work_voc_pad00/results/tune.json || exit 1
+echo "=== FINAL SPLIT AT PAD 0.0 (images come from the original work dir) ==="
+cp /kaggle/working/work_voc_pad00/splits.json /kaggle/working/work_voc_pad00/splits_before_final.json
+python run_pipeline.py fetch --dataset voc --tasks 15+5 --workdir /kaggle/working/work_voc --voc_root /kaggle/input --n_train_per_task 2000 --n_eval 2000 --n_yolo_train 12000 --n_yolo_val 500 --n_tune 500 --n_final 2000 || echo "stage FINAL FETCH FAILED"
+if python -c "import json; a=json.load(open('/kaggle/working/work_voc_pad00/splits_before_final.json')); b=json.load(open('/kaggle/working/work_voc/splits.json')); assert a['eval_ids']==b['eval_ids'] and a['tune_ids']==b['tune_ids'] and b['final_ids'], 'ids changed'; print('eval and tune ids unchanged; final images:', len(b['final_ids']))"; then
+cp /kaggle/working/work_voc/splits.json /kaggle/working/work_voc_pad00/splits.json; cp /kaggle/working/work_voc/paths.json /kaggle/working/work_voc_pad00/paths.json
+python run_pipeline.py extract --workdir /kaggle/working/work_voc_pad00 --splits final --conf 0.001 --max_det 300 --max_boxes 60 --pad 0.0 || echo "stage FINAL EXTRACT FAILED"
+else echo "stage FINAL EXTRACT SKIPPED: the eval/tune ids changed, do not use this final split"; fi
+echo "=== RESULT FILES ==="
+ls -l /kaggle/working/work_voc_pad00/results
+tar --exclude=yolo_data/images --exclude=voc_coco/images -cf /kaggle/working/work_voc_pad00_after_final_split.tar -C /kaggle/working work_voc_pad00
+echo "=== ALL DONE ==="
+ls -lh /kaggle/working/*.tar
+```
+
+**Expect:** Banners `=== RESTORE ===` (two tars), `=== FINAL SPLIT AT PAD 0.0 ... ===` with `eval and tune ids unchanged; final images: 2000`, then `extracted 2000 images (final)`, `=== RESULT FILES ===`, `=== ALL DONE ===`; `work_voc_pad00_after_final_split.tar`. About 10 minutes of extraction (541 s at pad 0.1). Nothing is scored on the final split here.
+
+## Commit it
+Save Version -> **Save & Run All (Commit)** -> open Advanced settings and make sure it runs with a GPU. Close the tab. Expect roughly 2.5-3.5 hours
+for the VOC chain (my estimate: fetch/convert a few minutes, detector ~100 min for 12k images x 40 epochs, extract ~30 min, experiments a few minutes).
+It stops at the first error (`set -e`); the log shows which banner it was under.
+
+## When it finishes
+Open the version: **Notebook** tab shows the printed output, **Output** tab lists the four tars (`work_voc_after_fetch/yolo/extract/run.tar`).
+Download `work_voc_after_extract.tar` (and `_run.tar`) to your computer and Drive as a second copy. Paste the sections under `=== FETCH ===`,
+`=== GATE-CLIP ===`, the end of `=== YOLO ===`, `=== EXTRACT + GATE-RECALL ===` and `=== RUN ===`.
+
+## Using a finished version later (no re-running)
+New notebook -> Add Input -> **Notebook Output** -> pick the committed version, then:
+
+```
+%%bash
+set -e
+T=$(find /kaggle/input -name work_voc_after_extract.tar | head -1); echo "tar: $T"
+tar -xf "$T" -C /kaggle/working
+ls /kaggle/working/work_voc
+```
+The tars exclude the image links; `run` only needs the cache and annotations, which are inside. To re-run `gate-clip` or `extract`, first re-run
+the `fetch` line of Cell 2 (fast, no download once VOC is attached).
+
+## Other splits
+Same chain, different fetch line. COCO 70+10 (what was run before; images are downloaded, Internet On):
+
+```
+python run_pipeline.py fetch --tasks "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69|70,71,72,73,74,75,76,77,78,79" --workdir /kaggle/working/work_70_10 --coco_root /kaggle/working/coco --n_train_per_task 2000 --n_eval 1000 --n_yolo_train 5000 --n_yolo_val 300
+```
+Only `--dataset`, `--tasks`, `--workdir` and the image counts change. For COCO use `--n_eval 1000` or more so the rare new classes have enough boxes.
+
+## Kaggle quirks
+- Files in `/kaggle/working` are lost when an *interactive* session stops; a committed version keeps them.
+- Check the weekly GPU quota in your profile before starting; a committed run uses it for its whole duration.
+- If the T4 x2 setting gives CUDA errors, switch to a single P100 and tell me the error.
+- If the version stays "Running" long after the log ends, it may be saving a large output; open the Notebook tab, the printed results are there.
